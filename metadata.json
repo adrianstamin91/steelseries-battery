@@ -1,0 +1,7 @@
+{
+  "uuid": "steelseries-battery@gnome",
+  "name": "SteelSeries Battery",
+  "description": "Show battery levels for supported SteelSeries headsets in the GNOME panel.",
+  "version": 1,
+  "shell-version": ["46", "47", "48", "49"]
+}
