@@ -39,8 +39,6 @@ gnome-extensions install --force dist/steelseries-battery@gnome.shell-extension.
 make uninstall
 ```
 
-See [LEARNING.md](LEARNING.md) for the project roadmap.
-
 ## Nova 5 HID development
 
 The Arctis Nova 5 USB receiver uses vendor-specific HID reports, so it may not
