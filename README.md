@@ -6,7 +6,7 @@ UPower first, then BlueZ/D-Bus, and refreshes every 30 seconds.
 ## Install from GitHub
 
 ```bash
-git clone https://github.com/adrianstamin91/steelseries-battery-gnome.git
+git clone https://github.com/adrianstamin91/steelseries-battery.git
 cd steelseries-battery-gnome
 make install
 sudo make install-udev
