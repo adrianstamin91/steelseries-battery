@@ -13,12 +13,18 @@ const OBJECT_MANAGER = 'org.freedesktop.DBus.ObjectManager';
 const PROPERTIES = 'org.freedesktop.DBus.Properties';
 const REFRESH_SECONDS = 30;
 
-function managedObjects(bus, service) {
+function managedObjectsAsync(bus, service, callback) {
     try {
-        return bus.call_sync(service, '/', OBJECT_MANAGER, 'GetManagedObjects', null, null,
-            Gio.DBusCallFlags.NONE, 3000, null).deep_unpack()[0];
+        bus.call(service, '/', OBJECT_MANAGER, 'GetManagedObjects', null, null,
+            Gio.DBusCallFlags.NONE, 3000, null, (_connection, result) => {
+                try {
+                    callback(result ? bus.call_finish(result).deep_unpack()[0] : null);
+                } catch (_error) {
+                    callback(null);
+                }
+            });
     } catch (_error) {
-        return null;
+        callback(null);
     }
 }
 
@@ -48,27 +54,53 @@ const Indicator = GObject.registerClass(class Indicator extends PanelMenu.Button
         this.menu.addMenuItem(this._status);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         const refresh = new PopupMenu.PopupMenuItem('Refresh');
-        refresh.connect('activate', () => this._refresh());
+        refresh.connect('activate', () => this._queueRefresh());
         this.menu.addMenuItem(refresh);
 
         for (const service of [UPOWER, BLUEZ]) {
             this._signals.push(this._bus.signal_subscribe(service, PROPERTIES, 'PropertiesChanged',
-                null, null, Gio.DBusSignalFlags.NONE, () => this._refresh()));
+                null, null, Gio.DBusSignalFlags.NONE, () => this._queueRefresh()));
         }
-        this._refresh();
+        this._refreshScheduled = false;
+        this._refreshInFlight = false;
+        this._refreshAgain = false;
+        this._destroyed = false;
+        this._queueRefresh();
         this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, REFRESH_SECONDS, () => {
-            this._refresh();
+            this._queueRefresh();
             return GLib.SOURCE_CONTINUE;
         });
     }
 
-    _refresh() {
-        const device = this._findDevice();
-        if (!device) {
-            this._probeNova5();
+    _queueRefresh() {
+        if (this._destroyed) return;
+        if (this._refreshInFlight) {
+            this._refreshAgain = true;
             return;
         }
-        this._showDevice(device);
+        if (this._refreshScheduled) return;
+        this._refreshScheduled = true;
+        GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._refreshScheduled = false;
+            if (!this._destroyed) this._refreshAsync();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _refreshAsync() {
+        if (this._refreshInFlight) return;
+        this._refreshInFlight = true;
+        this._findDeviceAsync(device => {
+            if (!this._destroyed) {
+                if (device) this._showDevice(device);
+                else this._probeNova5();
+            }
+            this._refreshInFlight = false;
+            if (this._refreshAgain) {
+                this._refreshAgain = false;
+                this._queueRefresh();
+            }
+        });
     }
 
     _showDevice(device) {
@@ -120,37 +152,42 @@ const Indicator = GObject.registerClass(class Indicator extends PanelMenu.Button
         this.tooltip_text = 'SteelSeries Battery: not detected';
     }
 
-    _findDevice() {
-        const objects = managedObjects(this._bus, UPOWER);
-        if (objects) {
-            for (const [path, interfaces] of Object.entries(objects)) {
-                const props = interfaces['org.freedesktop.UPower.Device'];
-                if (!props) continue;
-                const text = [path, props['Model'], props['Vendor'], props['NativePath']].map(value).join(' ');
-                if (isSteelSeries(text)) {
-                    return {name: value(props['Model']) || 'SteelSeries headset',
-                        percentage: Number(value(props['Percentage'])),
-                        charging: [1, 4].includes(Number(value(props['State']))), source: 'UPower'};
+    _findDeviceAsync(callback) {
+        managedObjectsAsync(this._bus, UPOWER, objects => {
+            if (objects) {
+                for (const [path, interfaces] of Object.entries(objects)) {
+                    const props = interfaces['org.freedesktop.UPower.Device'];
+                    if (!props) continue;
+                    const text = [path, props['Model'], props['Vendor'], props['NativePath']].map(value).join(' ');
+                    if (isSteelSeries(text)) {
+                        callback({name: value(props['Model']) || 'SteelSeries headset',
+                            percentage: Number(value(props['Percentage'])),
+                            charging: [1, 4].includes(Number(value(props['State']))), source: 'UPower'});
+                        return;
+                    }
                 }
             }
-        }
-        const bluez = managedObjects(this._bus, BLUEZ);
-        if (bluez) {
-            for (const [path, interfaces] of Object.entries(bluez)) {
-                const device = interfaces['org.bluez.Device1'];
-                const battery = interfaces['org.bluez.Battery1'];
-                if (!device || !battery) continue;
-                const text = [path, device['Name'], device['Alias'], device['Icon']].map(value).join(' ');
-                if (isSteelSeries(text)) {
-                    return {name: value(device['Alias']) || value(device['Name']) || 'SteelSeries headset',
-                        percentage: Number(value(battery['Percentage'])), charging: false, source: 'Bluetooth'};
+            managedObjectsAsync(this._bus, BLUEZ, bluez => {
+                if (bluez) {
+                    for (const [path, interfaces] of Object.entries(bluez)) {
+                        const device = interfaces['org.bluez.Device1'];
+                        const battery = interfaces['org.bluez.Battery1'];
+                        if (!device || !battery) continue;
+                        const text = [path, device['Name'], device['Alias'], device['Icon']].map(value).join(' ');
+                        if (isSteelSeries(text)) {
+                            callback({name: value(device['Alias']) || value(device['Name']) || 'SteelSeries headset',
+                                percentage: Number(value(battery['Percentage'])), charging: false, source: 'Bluetooth'});
+                            return;
+                        }
+                    }
                 }
-            }
-        }
-        return null;
+                callback(null);
+            });
+        });
     }
 
     destroy() {
+        this._destroyed = true;
         this._probe?.force_exit();
         if (this._timer) GLib.source_remove(this._timer);
         for (const id of this._signals) this._bus.signal_unsubscribe(id);
