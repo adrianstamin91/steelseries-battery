@@ -57,27 +57,25 @@ def main():
     if not found:
         raise SystemExit("No Arctis Nova 5 HID interfaces found")
 
-    handles = []
-    for node, physical_path in found:
-        try:
-            fd = os.open(node, os.O_RDWR | os.O_NONBLOCK)
-            handles.append((node, physical_path, fd))
-            log(f"opened {node} ({physical_path})")
-        except OSError as error:
-            log(f"skipping {node}: {error}")
-
-    if not handles:
-        raise SystemExit("No HID interfaces could be opened; install the udev rule first")
-
-    # The Nova 5 status poll is a 64-byte, read-only vendor request.
-    command_fd = next((fd for node, path, fd in handles if path.endswith("/input3")), None)
-    if command_fd is None:
+    command = next(((node, path) for node, path in found if path.endswith("/input3")), None)
+    if command is None:
         raise SystemExit("The command interface (input3) is not accessible")
+
+    # Only input3 accepts the vendor status request. Avoid opening the other
+    # HID interfaces read/write, especially when the device is behind a KVM.
+    command_node, command_path = command
+    try:
+        command_fd = os.open(command_node, os.O_RDWR | os.O_NONBLOCK)
+        log(f"opened {command_node} ({command_path})")
+    except OSError as error:
+        raise SystemExit(f"Could not open {command_node}: {error}")
+
+    handles = [(command_node, command_path, command_fd)]
     os.write(command_fd, bytes((0x00, 0xB0)) + bytes(62))
 
     deadline = time.monotonic() + args.seconds
     result = None
-    fd_to_node = {fd: node for node, _path, fd in handles}
+    fd_to_node = {command_fd: command_node}
     while time.monotonic() < deadline:
         ready, _, _ = select.select(list(fd_to_node), [], [], 0.5)
         for fd in ready:

@@ -40,8 +40,10 @@ const Indicator = GObject.registerClass(class Indicator extends PanelMenu.Button
     _init(extensionPath) {
         super._init(0.0, 'SteelSeries Battery');
         this._extensionPath = extensionPath;
-        this._bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, null);
+        this._bus = null;
         this._signals = [];
+        this._signalTimer = 0;
+        this._probeRequested = false;
 
         this._box = new St.BoxLayout({style_class: 'steelseries-battery-panel'});
         this._icon = new St.Icon({icon_name: 'battery-missing-symbolic', style_class: 'system-status-icon'});
@@ -54,7 +56,7 @@ const Indicator = GObject.registerClass(class Indicator extends PanelMenu.Button
         this.menu.addMenuItem(this._status);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         const refresh = new PopupMenu.PopupMenuItem('Refresh');
-        refresh.connect('activate', () => this._queueRefresh());
+        refresh.connect('activate', () => this._queueRefresh(true));
         this.menu.addMenuItem(refresh);
 
         for (const service of [UPOWER, BLUEZ]) {
@@ -63,21 +65,30 @@ const Indicator = GObject.registerClass(class Indicator extends PanelMenu.Button
         }
         this._refreshScheduled = false;
         this._refreshInFlight = false;
-        this._refreshAgain = false;
         this._destroyed = false;
-        this._queueRefresh();
+        Gio.bus_get(Gio.BusType.SYSTEM, null, (_source, result) => {
+            if (this._destroyed) return;
+            try {
+                this._bus = Gio.bus_get_finish(result);
+                for (const service of [UPOWER, BLUEZ]) {
+                    this._signals.push(this._bus.signal_subscribe(service, PROPERTIES, 'PropertiesChanged',
+                        null, null, Gio.DBusSignalFlags.NONE, () => this._scheduleSignalRefresh()));
+                }
+                this._queueRefresh(true);
+            } catch (_error) {
+                this._showMissing();
+            }
+        });
         this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, REFRESH_SECONDS, () => {
-            this._queueRefresh();
+            this._queueRefresh(true);
             return GLib.SOURCE_CONTINUE;
         });
     }
 
-    _queueRefresh() {
-        if (this._destroyed) return;
-        if (this._refreshInFlight) {
-            this._refreshAgain = true;
-            return;
-        }
+    _queueRefresh(probe = false) {
+        if (this._destroyed || !this._bus) return;
+        this._probeRequested ||= probe;
+        if (this._refreshInFlight) return;
         if (this._refreshScheduled) return;
         this._refreshScheduled = true;
         GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
@@ -87,19 +98,26 @@ const Indicator = GObject.registerClass(class Indicator extends PanelMenu.Button
         });
     }
 
+    _scheduleSignalRefresh() {
+        if (this._destroyed || this._signalTimer) return;
+        this._signalTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
+            this._signalTimer = 0;
+            this._queueRefresh(false);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
     _refreshAsync() {
         if (this._refreshInFlight) return;
         this._refreshInFlight = true;
+        const probe = this._probeRequested;
+        this._probeRequested = false;
         this._findDeviceAsync(device => {
             if (!this._destroyed) {
                 if (device) this._showDevice(device);
-                else this._probeNova5();
+                else if (probe) this._probeNova5();
             }
             this._refreshInFlight = false;
-            if (this._refreshAgain) {
-                this._refreshAgain = false;
-                this._queueRefresh();
-            }
         });
     }
 
@@ -122,21 +140,22 @@ const Indicator = GObject.registerClass(class Indicator extends PanelMenu.Button
                 argv: ['python3', script, '--json', '--seconds', '2'],
                 flags: Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE,
             });
-            this._probe.init(null);
-            this._probe.communicate_utf8_async(null, null, (_process, result) => {
+            const probe = this._probe;
+            probe.init(null);
+            probe.communicate_utf8_async(null, null, (_process, result) => {
                 try {
-                    const [, stdout] = this._probe.communicate_utf8_finish(result);
+                    const [, stdout] = probe.communicate_utf8_finish(result);
                     const data = JSON.parse(stdout.trim().split('\n').pop());
-                    if (Number.isFinite(data.battery)) {
+                    if (!this._destroyed && Number.isFinite(data.battery)) {
                         this._showDevice({name: 'SteelSeries Arctis Nova 5', percentage: data.battery,
                             charging: Boolean(data.charging), source: 'USB HID'});
-                    } else {
+                    } else if (!this._destroyed) {
                         this._showMissing();
                     }
                 } catch (_error) {
-                    this._showMissing();
+                    if (!this._destroyed) this._showMissing();
                 } finally {
-                    this._probe = null;
+                    if (this._probe === probe) this._probe = null;
                 }
             });
         } catch (_error) {
@@ -190,7 +209,10 @@ const Indicator = GObject.registerClass(class Indicator extends PanelMenu.Button
         this._destroyed = true;
         this._probe?.force_exit();
         if (this._timer) GLib.source_remove(this._timer);
-        for (const id of this._signals) this._bus.signal_unsubscribe(id);
+        if (this._signalTimer) GLib.source_remove(this._signalTimer);
+        if (this._bus) {
+            for (const id of this._signals) this._bus.signal_unsubscribe(id);
+        }
         super.destroy();
     }
 });
